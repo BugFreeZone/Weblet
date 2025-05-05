@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name='Weblet',
-    version='1.1.0',
+    version='1.0.0',
     description='Minimalist HTTP server library for Python with routing, middleware, HTTPS, templates, async, and multi-DB support',
     author='BugFreeZone',
     author_email='r96177385@gmail.com',
