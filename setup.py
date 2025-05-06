@@ -12,7 +12,8 @@ setup(
     install_requires=[
         'Jinja2>=3.0',
         'mysql-connector-python',
-        'asgiref'
+        'asgiref',
+        'watchdog'
     ],
     include_package_data=True,
     license='MIT',
