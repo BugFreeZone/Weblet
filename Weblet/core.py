@@ -12,11 +12,13 @@ import traceback
 import time
 import logging
 
+# Для шаблонов
 try:
     from jinja2 import Environment, FileSystemLoader, select_autoescape
 except ImportError:
     Environment = None
 
+# Для hot reload
 try:
     from watchdog.observers import Observer
     from watchdog.events import FileSystemEventHandler
@@ -53,13 +55,14 @@ class SimpleServer:
         self._server_socket = None
         self._should_stop = False
         self.debug = debug
-        self.sessions = {}
-        self.rate_limit_data = {}
+        self.sessions = {}  # session_id -> dict
+        self.rate_limit_data = {}  # ip -> [timestamps]
         self.static_folder = static_folder
         self.rate_limit = rate_limit
         self.rate_period = rate_period
         self.max_request_size = max_request_size
         self.max_header_line = max_header_line
+        # Jinja2 шаблоны
         if Environment and os.path.isdir(template_folder):
             self.template_env = Environment(
                 loader=FileSystemLoader(template_folder),
@@ -67,6 +70,7 @@ class SimpleServer:
             )
         else:
             self.template_env = None
+        # Логирование в файл
         logging.basicConfig(
             filename='server.log',
             filemode='a',
@@ -74,6 +78,7 @@ class SimpleServer:
             level=logging.INFO
         )
 
+    # --- HOT RELOAD (debug only) ---
     def _start_with_hot_reload(self, debug):
         if not Observer:
             print("Для hot reload требуется установить watchdog: pip install watchdog")
@@ -93,6 +98,7 @@ class SimpleServer:
             observer.stop()
         observer.join()
 
+    # --- DEBUG MIDDLEWARE ---
     def _debug_middleware(self, req):
         if self.debug:
             print("\n--- [REQUEST] ---")
@@ -103,10 +109,12 @@ class SimpleServer:
             print("Body:", req['body'])
         return None
 
+    # --- RATE LIMIT MIDDLEWARE ---
     def _rate_limit_middleware(self, req):
         ip = req.get('client_ip')
         now = time.time()
         timestamps = self.rate_limit_data.setdefault(ip, [])
+        # Удаляем старые записи
         timestamps = [t for t in timestamps if now - t < self.rate_period]
         if len(timestamps) >= self.rate_limit:
             logging.warning(f"Rate limit exceeded for {ip}")
@@ -115,6 +123,7 @@ class SimpleServer:
         self.rate_limit_data[ip] = timestamps
         return None
 
+    # --- SESSION MIDDLEWARE ---
     def _session_middleware(self, req):
         cookies = req.get('cookies', {})
         sid = cookies.get('session_id')
@@ -126,6 +135,7 @@ class SimpleServer:
         req['session_id'] = sid
         return None
 
+    # --- STATIC FILES HANDLER ---
     def _static_handler(self, req):
         path = req['path']
         if path.startswith('/static/'):
@@ -162,13 +172,16 @@ class SimpleServer:
             'txt': 'text/plain',
         }.get(ext, 'application/octet-stream')
 
+    # --- ROUTING (динамические маршруты) ---
     def route(self, path, methods=['GET']):
+        # path может содержать параметры: /user/<id>
         def decorator(func):
             self.routes.append((self._parse_route(path), methods, func))
             return func
         return decorator
 
     def _parse_route(self, path):
+        # Преобразует /user/<id> в список: ['user', '<id>']
         return [segment for segment in path.strip('/').split('/')]
 
     def _match_route(self, req_path, method):
@@ -190,6 +203,7 @@ class SimpleServer:
                 return func, params
         return None, {}
 
+    # --- DATABASE ---
     def db(self):
         if self.db_type == 'sqlite':
             import sqlite3
@@ -208,23 +222,30 @@ class SimpleServer:
         else:
             raise Exception(f"Unknown db_type: {self.db_type}")
 
+    # --- TEMPLATES ---
     def render_template(self, template_name, **context):
         if not self.template_env:
             raise Exception("Jinja2 is not installed or template folder not found")
         template = self.template_env.get_template(template_name)
         return template.render(**context)
 
+    # --- MIDDLEWARE ---
     def add_middleware(self, func):
         self.middlewares.append(func)
 
+    # --- SERVER START ---
     def start(self, debug=False, hot_reload=False):
         self.debug = debug
+        # Вставить нужные middleware
         self.middlewares = []
         if self.debug:
             self.middlewares.append(self._debug_middleware)
         self.middlewares.append(self._rate_limit_middleware)
         self.middlewares.append(self._session_middleware)
         self.middlewares.append(self._static_handler)
+        # Пользовательские middleware добавляются после
+        # (можно поменять порядок по желанию)
+        # Hot reload
         if hot_reload and self.debug:
             self._start_with_hot_reload(debug)
             return
@@ -251,10 +272,40 @@ class SimpleServer:
                     try:
                         client, addr = s.accept()
                     except OSError:
-                        break
+                        break  # сокет был закрыт
                     Thread(target=self.handle_client, args=(client, addr)).start()
             print("Server stopped.")
 
+    async def _start_async(self):
+        server = await asyncio.start_server(self.handle_client, self.host, self.port, ssl=self._ssl_context() if self.use_https else None)
+        print(f"Async server running on http{'s' if self.use_https else ''}://{self.host}:{self.port} (debug={self.debug})")
+
+        loop = asyncio.get_running_loop()
+        stop_event = asyncio.Event()
+
+        def stop():
+            print("\nShutting down async server...")
+            stop_event.set()
+
+        try:
+            loop.add_signal_handler(signal.SIGINT, stop)
+        except NotImplementedError:
+            pass
+
+        async with server:
+            await stop_event.wait()
+            server.close()
+            await server.wait_closed()
+        print("Async server stopped.")
+
+    def _ssl_context(self):
+        if not self.certfile or not self.keyfile:
+            raise Exception("certfile and keyfile required for HTTPS")
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(certfile=self.certfile, keyfile=self.keyfile)
+        return context
+
+    # --- REQUEST HANDLING ---
     def parse_request(self, request):
         head, _, body = request.partition('\r\n\r\n')
         headers = head.split('\r\n') if head else []
@@ -287,6 +338,7 @@ class SimpleServer:
         elif 'application/x-www-form-urlencoded' in content_type:
             return {k: v[0] if len(v)==1 else v for k, v in parse_qs(body).items()}
         elif 'multipart/form-data' in content_type:
+            # Примитивный парсер (только поля, без файлов)
             boundary = content_type.split('boundary=')[-1]
             parts = body.split('--' + boundary)
             data = {}
@@ -300,33 +352,48 @@ class SimpleServer:
             return data
         return body
 
+    # --- SYNC REQUEST HANDLER ---
     def handle_client(self, client, addr=None):
-        try:
-            client.settimeout(5)
-            with client:
-                try:
-                    request = client.recv(self.max_request_size)
-                except socket.timeout:
-                    # Просто молча закрываем соединение при таймауте
-                    return
-                except Exception:
-                    # Любая другая ошибка при чтении - тоже закрываем соединение
-                    return
-                if len(request) == self.max_request_size:
-                    self.send_response(client, 413, 'Payload Too Large', {}, 'text/plain')
-                    return
-                try:
-                    request = request.decode('utf-8', errors='replace')
-                except Exception:
-                    request = request.decode('latin1', errors='replace')
-                try:
-                    headers, body = self.parse_request(request)
-                except Exception:
-                    self.send_response(client, 400, 'Header Too Long', {}, 'text/plain')
-                    return
-                if not headers:
+        client.settimeout(5)
+        with client:
+            data = b''
+            try:
+                # 1. Читаем заголовки (до \r\n\r\n)
+                while b'\r\n\r\n' not in data:
+                    chunk = client.recv(4096)
+                    if not chunk:
+                        break
+                    data += chunk
+                    if len(data) > self.max_request_size:
+                        self.send_response(client, 413, 'Payload Too Large', {}, 'text/plain')
+                        return
+
+                if b'\r\n\r\n' not in data:
                     self.send_response(client, 400, 'Bad Request', {}, 'text/plain')
                     return
+
+                head, sep, body = data.partition(b'\r\n\r\n')
+                headers = head.decode('utf-8', errors='replace').split('\r\n')
+                headers_dict = self.parse_headers(headers[1:])
+
+                # 2. Если есть Content-Length, дочитываем тело
+                content_length = int(headers_dict.get('content-length', '0'))
+                body = body or b''
+                while len(body) < content_length:
+                    chunk = client.recv(min(4096, content_length - len(body)))
+                    if not chunk:
+                        break
+                    body += chunk
+                    if len(body) > self.max_request_size:
+                        self.send_response(client, 413, 'Payload Too Large', {}, 'text/plain')
+                        return
+
+                try:
+                    body_decoded = body.decode('utf-8', errors='replace')
+                except Exception:
+                    body_decoded = body.decode('latin1', errors='replace')
+
+                # 3. Парсим строку запроса
                 try:
                     method, path, _ = headers[0].split()
                 except Exception:
@@ -338,9 +405,9 @@ class SimpleServer:
                     'method': method,
                     'path': parsed_path.path,
                     'query': parse_qs(parsed_path.query),
-                    'headers': self.parse_headers(headers[1:]),
+                    'headers': headers_dict,
                     'cookies': self.parse_cookies(headers[1:]),
-                    'body': self.parse_body(body, headers),
+                    'body': self.parse_body(body_decoded, headers),
                     'client_ip': addr[0] if addr else 'unknown'
                 }
 
@@ -378,10 +445,17 @@ class SimpleServer:
                         self.send_response(client, 500, {'error': str(e)}, {}, 'application/json')
                 else:
                     self.send_response(client, 404, {'error': 'Not Found'}, {}, 'application/json')
-        except Exception:
-            # Любая ошибка вне чтения - тоже молча закрываем соединение
-            return
 
+            except socket.timeout:
+                self.send_response(client, 408, 'Request Timeout', {}, 'text/plain')
+            except Exception as e:
+                if self.debug:
+                    print("\n--- [EXCEPTION] ---")
+                    traceback.print_exc()
+                logging.error(traceback.format_exc())
+                self.send_response(client, 500, {'error': str(e)}, {}, 'application/json')
+
+    # --- RESPONSE ---
     def send_response(self, client, status_code, content, extra_headers, content_type='text/html'):
         if self.debug:
             print("\n--- [RESPONSE] ---")
@@ -412,6 +486,7 @@ class SimpleServer:
             response = response.encode('utf-8')
         client.sendall(response)
 
+    # --- RESPONSE HELPERS ---
     def response(self, content, status=200, content_type='text/html', headers=None, encoding='utf-8'):
         if headers is None:
             headers = {}
@@ -433,6 +508,7 @@ class SimpleServer:
         headers['Location'] = location
         return status, '', headers, 'text/plain'
 
+    # --- UTILS ---
     @staticmethod
     def get_query_param(req, name, default=None):
         values = req.get('query', {}).get(name)
@@ -508,6 +584,7 @@ class SimpleServer:
             511: 'Network Authentication Required',
         }.get(code, 'Unknown Status')
 
+# --- HOT RELOAD HANDLER ---
 class ReloadHandler(FileSystemEventHandler):
     def __init__(self):
         self.should_reload = False
